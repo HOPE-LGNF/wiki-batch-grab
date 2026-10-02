@@ -252,3 +252,131 @@ local p = {}
 	const produced = `${pageInfoHead({ title: '模块:实体/信息框', pageid: 2001, revid: 15001, contentModel: 'Scribunto', contentFormat: 'text/plain' })}\n\nlocal p = {}\n`;
 	assert.equal(produced, expected);
 });
+
+// ---------------------------------------------------------------- 命名空间前缀
+
+/** 造一个只回 siteinfo 与 allpages 的假 API，并记录收到的参数。 */
+function nsApi(namespaces) {
+	const calls = [];
+	const api = async params => {
+		calls.push(params);
+		if (params.meta === 'siteinfo') {
+			return { query: { namespaces } };
+		}
+		return { query: { allpages: [{ title: '占位' }] } };
+	};
+	return { api, calls, listCall: () => calls.find(c => c.list === 'allpages') };
+}
+
+const REAL_NAMESPACES = {
+	'0': { id: 0, case: 'first-letter', name: '', subpages: true },
+	'10': { id: 10, case: 'first-letter', name: '模板', subpages: true, canonical: 'Template' },
+	'828': { id: 828, case: 'first-letter', name: '模块', subpages: true, canonical: 'Module', aliases: ['Module'] },
+};
+
+test('命名空间前缀：拆成 apnamespace + apprefix（真实站点的 invalidtitle 回归）', async () => {
+	// 真实站点上 apprefix="模块:建筑/" 会报 invalidtitle: Bad title "模块:建筑/"，
+	// 因为 apprefix 只接受不含命名空间的标题前缀。
+	const { api, listCall } = nsApi(REAL_NAMESPACES);
+	const titles = await collectTitles({ prefix: '模块:建筑/' }, api);
+	assert.deepEqual(titles, ['占位']);
+	assert.equal(listCall().apnamespace, 828, '命名空间必须单独用 apnamespace 传');
+	assert.equal(listCall().apprefix, '建筑/', 'apprefix 只能是不含命名空间的标题前缀');
+});
+
+test('命名空间前缀：别名也认（Module → 828）', async () => {
+	const { api, listCall } = nsApi(REAL_NAMESPACES);
+	await collectTitles({ prefix: 'Module:建筑/' }, api);
+	assert.equal(listCall().apnamespace, 828);
+	assert.equal(listCall().apprefix, '建筑/');
+});
+
+test('命名空间前缀：空的页面前缀（"模块:"）也能用，且不带 apnamespace 时默认主命名空间', async () => {
+	const { api, listCall } = nsApi(REAL_NAMESPACES);
+	await collectTitles({ prefix: '模块:' }, api);
+	assert.equal(listCall().apnamespace, 828);
+	assert.equal(listCall().apprefix, '');
+
+	const plain = nsApi(REAL_NAMESPACES);
+	await collectTitles({ prefix: '建筑/' }, plain.api);
+	assert.equal(plain.listCall().apnamespace, undefined, '不带命名空间时不应传 apnamespace（默认即主命名空间）');
+	assert.equal(plain.listCall().apprefix, '建筑/');
+});
+
+test('命名空间前缀：冒号前不是命名空间时按主命名空间处理并提示（标题里带冒号是合法的）', async () => {
+	const { api, listCall } = nsApi(REAL_NAMESPACES);
+	const logged = [];
+	const titles = await collectTitles({ prefix: '游戏:设置' }, api, m => logged.push(m));
+	assert.deepEqual(titles, ['占位']);
+	assert.equal(listCall().apnamespace, undefined);
+	assert.equal(listCall().apprefix, '游戏:设置', '整个前缀都当标题前缀');
+	assert.ok(logged.some(m => m.includes('不是本站的命名空间')), `应给出提示，实际：${JSON.stringify(logged)}`);
+});
+
+test('formatversion=2 的命名空间字段名是 name，不是 "*"', async () => {
+	// 真实站点在 formatversion=2 下 ns.name 有值、ns['*'] 不存在；只读后者会永远匹配不到
+	const { api, listCall } = nsApi(REAL_NAMESPACES);
+	await collectTitles({ prefix: '模板:沙盒/' }, api);
+	assert.equal(listCall().apnamespace, 10);
+});
+
+// ---------------------------------------------------------------- TLS 指纹会话
+
+test('--tls：会话惰性创建、复用、用完关闭，参数正确透传', async () => {
+	let created = 0;
+	let closed = 0;
+	let received;
+	const fakeSession = {
+		async fetch() {
+			return { ok: true, status: 200, async json() { return { query: {} }; } };
+		},
+		async close() {
+			closed += 1;
+		},
+	};
+	const api = createClient({ scheme: 'https://', site: 'x.invalid', apiPath: '/api.php', tls: 'chrome' }, undefined, opts => {
+		created += 1;
+		received = opts;
+		return fakeSession;
+	});
+
+	assert.equal(created, 0, '不应在建 client 时就建会话');
+	await api({ action: 'query' });
+	assert.equal(created, 1);
+	await api({ action: 'query' });
+	assert.equal(created, 1, '第二个请求应复用同一个会话');
+	assert.deepEqual(received, { browser: 'chrome', os: 'windows' });
+
+	await api.close();
+	assert.equal(closed, 1, '用完必须关闭原生会话');
+	await api.close();
+	assert.equal(closed, 1, '重复关闭应无害');
+});
+
+test('不用 --tls 时完全走注入的 fetch，不碰 wreq-js', async () => {
+	let asked = 0;
+	const api = createClient({ scheme: 'https://', site: 'x.invalid', apiPath: '/api.php' }, async () => {
+		asked += 1;
+		return { ok: true, status: 200, async json() { return { query: {} }; } };
+	});
+	await api({ action: 'query' });
+	assert.equal(asked, 1);
+	await api.close();
+	assert.equal(asked, 1, '没有会话可关，也不应再发请求');
+});
+
+test('run() 结束时一定会关闭会话（即使中途失败）', async () => {
+	let closed = 0;
+	const api = async params => {
+		if (params.titles) {
+			throw new Error('故意失败');
+		}
+		return { query: {} };
+	};
+	api.close = async () => {
+		closed += 1;
+	};
+	await run({ out: tempDir(), batch: 20, delay: 0, pageInfo: false, nameStyle: 'dash', overwrite: false, quiet: true, dryRun: false, pages: ['A'] }, api, silent);
+	assert.equal(closed, 1, '失败路径也要关');
+});
+

@@ -44,6 +44,11 @@ const HELP = `批量导出 MediaWiki 页面源码
   --ua <string>          User-Agent。MediaWiki 要求 UA 能标识工具与联系方式（默认值已符合）
   --header "K: V"        追加/覆盖任意请求头，可重复。被 Cloudflare 质询时有用，例如
                          --header "Accept-Language: zh-CN,zh;q=0.9"
+  --tls <profile>        用浏览器的 TLS/HTTP2 指纹发请求（chrome / firefox / safari，
+                         也可写带版本的 chrome_142 这类）。Node 自带 OpenSSL 的 JA3/JA4
+                         与浏览器差异很大，Cloudflare 会在网络层直接拦；改 UA 无效。
+                         需要额外装 wreq-js（npm i wreq-js）且 Node >= 20；不指定本项时
+                         仍是零依赖的普通 fetch。
 
 页面来源（可叠加，结果取并集）
   --pages "A,B,C"        直接给标题
@@ -144,6 +149,9 @@ function parseArgs(argv) {
 			case '--quiet':
 				opts.quiet = true;
 				break;
+			case '--tls':
+				opts.tls = need(i++, a);
+				break;
 			default:
 				throw new Error(`未知参数：${a}（用 --help 看用法）`);
 		}
@@ -190,12 +198,38 @@ function apiUrl(opts, params) {
 	return url;
 }
 
-export function createClient(opts, fetchImpl = fetch) {
+export function createClient(opts, fetchImpl = fetch, createSessionImpl) {
 	const ua = opts.ua ?? 'wiki-batch-export/1.0 (https://github.com/HOPE-LGNF/wiki-batch-grab)';
-	return async function api(params) {
+
+	// --tls 时不走 Node 自带的 OpenSSL：那边 TLS ClientHello 的 JA3/JA4 指纹与浏览器差异很大，
+	// Cloudflare 这类防护在网络层就能判定为机器人（改 UA、补请求头都只能解决一部分）。
+	// 用 wreq-js 的指纹会话；不用 --tls 时就是普通 fetch，保持零依赖。
+	// 第三参数只为测试注入，正常调用不传。
+	let sessionPromise;
+	let closed = false;
+
+	const getSession = () => {
+		if (!sessionPromise) {
+			sessionPromise = (async () => {
+				let createSession = createSessionImpl;
+				if (!createSession) {
+					try {
+						({ createSession } = await import('wreq-js'));
+					} catch (error) {
+						throw new Error(`--tls 需要 wreq-js（npm i wreq-js，且 Node >= 20）：${error.message}`);
+					}
+				}
+				return createSession({ browser: opts.tls, os: opts.os ?? 'windows' });
+			})();
+		}
+		return sessionPromise;
+	};
+
+	const api = async params => {
 		// 只有这两个是工具自己设的，其余交给 fetch 的默认值；--header 可以覆盖任意一个
 		const headers = { 'User-Agent': ua, Accept: 'application/json', ...(opts.headers ?? {}) };
-		const res = await fetchImpl(apiUrl(opts, params), { headers });
+		const url = apiUrl(opts, params).toString();
+		const res = opts.tls ? await (await getSession()).fetch(url, { headers }) : await fetchImpl(url, { headers });
 		if (!res.ok) {
 			throw new Error(`HTTP ${res.status}：${(await res.text()).slice(0, 200).replace(/\s+/g, ' ')}`);
 		}
@@ -205,13 +239,70 @@ export function createClient(opts, fetchImpl = fetch) {
 		}
 		return data;
 	};
+
+	/** 释放 --tls 占用的原生会话：Rust 侧持有连接池，wreq-js 的文档明确要求用完 close()。 */
+	api.close = async () => {
+		if (closed) {
+			return;
+		}
+		closed = true;
+		if (!sessionPromise) {
+			return;
+		}
+		try {
+			const session = await sessionPromise;
+			await session.close?.();
+		} catch {
+			// 关闭失败不该影响已经完成的工作
+		}
+	};
+
+	return api;
 }
 
-/** 按前缀列举页面（走 list=allpages，含子页面）。 */
-async function listByPrefix(api, prefix, into) {
+/**
+ * 按前缀列举页面（走 list=allpages，含子页面）。
+ *
+ * MediaWiki 的 apprefix 只接受**不含命名空间**的标题前缀，把 "模块:建筑/" 整个丢过去会报
+ * invalidtitle；命名空间要单独用 apnamespace 传。所以这里把 "命名空间:前缀" 拆开，并把
+ * 命名空间名（含别名，如 Module）经 siteinfo 解析成数字 ID。
+ *
+ * 冒号前的部分若不是本站的命名空间——标题里带冒号是合法的，例如 "游戏:设置"——就按主命名
+ * 空间的普通前缀处理并提示一句，与修复前的行为一致，不会因为一次拼写就把整个导出搞挂。
+ */
+async function listByPrefix(api, prefix, into, log = () => {}) {
+	const colon = prefix.indexOf(':');
+	let apnamespace;
+	let pagePrefix = prefix;
+	if (colon > 0) {
+		const nsPrefix = prefix.slice(0, colon);
+		pagePrefix = prefix.slice(colon + 1);
+		const siteinfo = await api({ action: 'query', meta: 'siteinfo', siprop: 'namespaces' });
+		// 命名空间名：formatversion=2 在 ns.name，formatversion=1 在 ns['*']，两种都认。
+		// 而 namespaces 本身在两种 formatversion 下都是「按 id 做键的对象」，所以 key 就是 id。
+		for (const [id, ns] of Object.entries(siteinfo.query?.namespaces ?? {})) {
+			const names = [ns.name ?? ns['*'], ...(ns.aliases ?? [])].filter(Boolean);
+			if (names.includes(nsPrefix)) {
+				apnamespace = Number(id);
+				break;
+			}
+		}
+		if (apnamespace === undefined) {
+			log(`提示：「${nsPrefix}」不是本站的命名空间，按主命名空间的标题前缀处理`);
+			pagePrefix = prefix;
+		}
+	}
+
 	let cont;
 	do {
-		const data = await api({ action: 'query', list: 'allpages', apprefix: prefix, aplimit: 'max', ...(cont ?? {}) });
+		const data = await api({
+			action: 'query',
+			list: 'allpages',
+			apprefix: pagePrefix,
+			...(apnamespace !== undefined ? { apnamespace } : {}),
+			aplimit: 'max',
+			...(cont ?? {}),
+		});
 		for (const p of data.query?.allpages ?? []) {
 			into.add(p.title);
 		}
@@ -250,7 +341,7 @@ async function listAll(api, into) {
 	} while (cont);
 }
 
-export async function collectTitles(opts, api) {
+export async function collectTitles(opts, api, log = () => {}) {
 	const titles = new Set(opts.pages ?? []);
 	if (opts.file) {
 		for (const line of fs.readFileSync(opts.file, 'utf8').split(/\r?\n/)) {
@@ -261,7 +352,7 @@ export async function collectTitles(opts, api) {
 		}
 	}
 	if (opts.prefix) {
-		await listByPrefix(api, opts.prefix, titles);
+		await listByPrefix(api, opts.prefix, titles, log);
 	}
 	if (opts.category) {
 		await listByCategory(api, opts.category, titles);
@@ -275,7 +366,16 @@ export async function collectTitles(opts, api) {
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 export async function run(opts, api, log = console.log) {
-	const titles = await collectTitles(opts, api);
+	try {
+		return await runInner(opts, api, log);
+	} finally {
+		// --tls 会占一个原生会话，用完必须显式关闭
+		await api.close?.();
+	}
+}
+
+async function runInner(opts, api, log) {
+	const titles = await collectTitles(opts, api, log);
 	if (titles.length === 0) {
 		log('没有收集到任何页面标题。用法见 --help。');
 		return { written: 0, skipped: 0, failed: [] };
