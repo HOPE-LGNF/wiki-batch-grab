@@ -1,0 +1,13 @@
+{
+  "name": "wiki-batch-grab",
+  "version": "1.0.0",
+  "private": true,
+  "description": "批量从 MediaWiki 导出页面源码为本地文件，导出格式与 Wikitext 扩展兼容",
+  "type": "module",
+  "license": "MIT",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "test": "node --test",
+    "grab": "node batch-grab.mjs"
+  }
+}
