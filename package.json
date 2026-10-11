@@ -13,7 +13,7 @@
     "grab": "node batch-grab.mjs"
   },
   "peerDependencies": {
-    "wreq-js": ">=3"
+    "wreq-js": "^3.2.0"
   },
   "peerDependenciesMeta": {
     "wreq-js": {
