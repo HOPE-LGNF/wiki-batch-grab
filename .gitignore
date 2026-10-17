@@ -1,3 +1,7 @@
 node_modules/
 wiki-export/
 *.log
+
+# 可选依赖 wreq-js 由各人按需自装（npm i wreq-js），lock 只描述本机那一份；
+# 提交它会让 npm ci 反而把 wreq-js 装上，与「默认零依赖」相矛盾
+package-lock.json
